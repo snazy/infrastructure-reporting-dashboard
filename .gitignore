@@ -20,6 +20,8 @@ lib64/
 parts/
 sdist/
 var/
+htdocs/
+reporting-dashboard.yaml
 *.egg-info/
 .installed.cfg
 *.egg
