@@ -31,10 +31,10 @@ Useful options:
 tools/ghactions-local/run-backfill.sh --project mina --project iceberg
 DAYS=3 tools/ghactions-local/run-backfill.sh
 tools/ghactions-local/run-backfill.sh --days 14 --concurrency 4
-tools/ghactions-local/run-backfill.sh --append --project polaris
+tools/ghactions-local/run-backfill.sh --append --refresh-days 2 --project polaris
 ```
 
-The backfill stores GitHub workflow run IDs as SQLite row IDs and uses `INSERT OR REPLACE`, so rerunning it refreshes matching runs. Without `--append`, the DB is recreated first.
+The backfill only lists completed workflow runs. It stores their GitHub run IDs as SQLite row IDs. With `--append`, it reuses existing runs and only fetches job details for new runs plus runs updated during the trailing refresh window (one day by default). Without `--append`, the DB is recreated first.
 
 For repositories with many workflow runs, the backfill splits the requested time window so it can fetch more than GitHub's 1,000-result listing cap.
 

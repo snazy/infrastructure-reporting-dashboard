@@ -49,6 +49,7 @@ DEFAULT_PROJECTS = ("cassandra", "polaris", "iceberg", "airflow", "spark", "hado
 DEFAULT_DB = "var/ghactions.db"
 DEFAULT_CONCURRENCY = 1
 DEFAULT_MAX_RETRIES = 4
+DEFAULT_REFRESH_DAYS = 1
 GITHUB_API = "https://api.github.com"
 MAX_GITHUB_LIST_RESULTS = 1000
 RATE_LIMIT_RESET_MARGIN_SECONDS = 1
@@ -68,6 +69,15 @@ def parse_args():
     )
     parser.add_argument("--org", default="apache", help="GitHub organization, default: apache")
     parser.add_argument("--append", action="store_true", help="Append to an existing DB instead of recreating it")
+    parser.add_argument(
+        "--refresh-days",
+        type=float,
+        default=DEFAULT_REFRESH_DAYS,
+        help=(
+            "When appending, refresh existing runs updated in this trailing window, "
+            f"default: {DEFAULT_REFRESH_DAYS}"
+        ),
+    )
     parser.add_argument(
         "--concurrency",
         type=int,
@@ -171,7 +181,13 @@ class GitHubClient:
             if deadline <= self.cooldown_until:
                 return
             self.cooldown_until = deadline
-        print(f"GitHub API paused for {delay:.1f}s: {reason}", file=sys.stderr, flush=True)
+        resume_at = dt.datetime.fromtimestamp(self.wall_clock() + delay, tz=dt.UTC).astimezone()
+        print(
+            f"GitHub API paused until approximately {resume_at:%Y-%m-%d %H:%M:%S %Z} "
+            f"({delay:.1f}s): {reason}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     async def defer_if_rate_limited(self, headers):
         if headers.get("X-RateLimit-Remaining") != "0":
@@ -308,7 +324,7 @@ def setup_db(db_path, append):
 async def list_recent_runs(client, org, repo, days):
     end = dt.datetime.now(dt.UTC)
     start = end - dt.timedelta(days=days)
-    runs = await list_runs_window(client, org, repo, start, end)
+    runs = await list_runs_window(client, org, repo, start, end, status="completed")
     unique_runs = {run["id"]: run for run in runs}
     if len(unique_runs) != len(runs):
         duplicates = len(runs) - len(unique_runs)
@@ -320,10 +336,12 @@ def github_timestamp(value):
     return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-async def list_runs_window(client, org, repo, start, end, depth=0):
+async def list_runs_window(client, org, repo, start, end, depth=0, status=None):
     created_range = f"{github_timestamp(start)}..{github_timestamp(end)}"
-    params = urllib.parse.urlencode({"per_page": 100, "created": created_range})
-    url = f"{GITHUB_API}/repos/{org}/{repo}/actions/runs?{params}"
+    params = {"per_page": 100, "created": created_range}
+    if status:
+        params["status"] = status
+    url = f"{GITHUB_API}/repos/{org}/{repo}/actions/runs?{urllib.parse.urlencode(params)}"
     runs = []
     reported_total = None
     async for page in client.get_all_pages(url, f"{repo}: workflow runs"):
@@ -340,8 +358,8 @@ async def list_runs_window(client, org, repo, start, end, depth=0):
                     f"{repo}: {total} workflow runs match {created_range}; splitting query window",
                     flush=True,
                 )
-                first_half = await list_runs_window(client, org, repo, start, mid, depth + 1)
-                second_half = await list_runs_window(client, org, repo, mid, end, depth + 1)
+                first_half = await list_runs_window(client, org, repo, start, mid, depth + 1, status)
+                second_half = await list_runs_window(client, org, repo, mid, end, depth + 1, status)
                 return first_half + second_half
         if reported_total is None:
             print(f"{repo}: discovered {len(runs)} workflow runs so far", flush=True)
@@ -361,20 +379,6 @@ async def list_runs_window(client, org, repo, start, end, depth=0):
     return runs
 
 
-async def workflow_metadata(client, workflow_url, cache):
-    task = cache.get(workflow_url)
-    if task is None:
-        task = asyncio.create_task(client.get_json(workflow_url))
-        cache[workflow_url] = task
-    try:
-        metadata, _ = await task
-        return metadata
-    except BaseException:
-        if cache.get(workflow_url) is task:
-            del cache[workflow_url]
-        raise
-
-
 def insert_run(conn, run_dict):
     fields = tuple(run_dict.keys())
     placeholders = ", ".join("?" for _ in fields)
@@ -385,19 +389,22 @@ def insert_run(conn, run_dict):
     )
 
 
-async def parse_run(client, repo, run, metadata_cache):
+def workflow_path_from_run(run):
+    return (run.get("path") or "").rsplit("@", 1)[0]
+
+
+async def parse_run(client, repo, run):
     jobs_data, _ = await client.get_json(run["jobs_url"])
     seconds_used, run_start, run_finish, jobs = parse_jobs(jobs_data, repo)
     if not jobs or seconds_used <= 0 or run_start is None or run_finish is None:
         return None
-    workflow = await workflow_metadata(client, run["workflow_url"], metadata_cache)
     return {
         "id": run["id"],
         "project": infer_project(repo),
         "repo": repo,
-        "workflow_id": workflow.get("id", run.get("workflow_id", 0)),
-        "workflow_name": workflow.get("name", run.get("name", "Unknown")),
-        "workflow_path": workflow.get("path", ""),
+        "workflow_id": run.get("workflow_id", 0),
+        "workflow_name": run.get("name", "Unknown"),
+        "workflow_path": workflow_path_from_run(run),
         "seconds_used": int(seconds_used),
         "run_start": int(run_start),
         "run_finish": int(run_finish),
@@ -405,9 +412,30 @@ async def parse_run(client, repo, run, metadata_cache):
     }
 
 
-async def backfill_project(conn, client, org, repo, days, metadata_cache):
+def runs_needing_backfill(conn, repo, runs, refresh_since):
+    existing_ids = {row[0] for row in conn.execute("SELECT id FROM runs WHERE repo = ?", (repo,))}
+    selected = []
+    for run in runs:
+        updated_at = isoparse_ts(run.get("updated_at"))
+        if run["id"] not in existing_ids or updated_at is None or updated_at >= refresh_since.timestamp():
+            selected.append(run)
+    return selected
+
+
+async def backfill_project(conn, client, org, repo, days, append, refresh_days):
     print(f"Gathering information about {repo} for the last {days} day(s)", flush=True)
     runs = await list_recent_runs(client, org, repo, days)
+    if append:
+        refresh_since = dt.datetime.now(dt.UTC) - dt.timedelta(days=refresh_days)
+        selected_runs = runs_needing_backfill(conn, repo, runs, refresh_since)
+        reused = len(runs) - len(selected_runs)
+        if reused:
+            print(
+                f"{repo}: reused {reused} existing run(s); refreshing runs updated since "
+                f"{github_timestamp(refresh_since)}",
+                flush=True,
+            )
+        runs = selected_runs
     total = len(runs)
     if total == 0:
         print(f"{repo}: no workflow runs found", flush=True)
@@ -416,7 +444,7 @@ async def backfill_project(conn, client, org, repo, days, metadata_cache):
     inserted = 0
     skipped = 0
     completed = 0
-    tasks = [asyncio.create_task(parse_run(client, repo, run, metadata_cache)) for run in runs]
+    tasks = [asyncio.create_task(parse_run(client, repo, run)) for run in runs]
     progress_step = max(1, min(25, total // 10 or 1))
     for task in asyncio.as_completed(tasks):
         run_dict = await task
@@ -438,16 +466,17 @@ async def async_main(args):
         raise ValueError("--concurrency must be at least 1")
     if args.max_retries < 0:
         raise ValueError("--max-retries must not be negative")
+    if args.refresh_days < 0:
+        raise ValueError("--refresh-days must not be negative")
     if not args.token:
         print("Warning: no GitHub token set; anonymous API rate limits may be too low for backfills", file=sys.stderr)
     conn = setup_db(args.db, args.append)
-    metadata_cache = {}
     started = time.time()
     timeout = aiohttp.ClientTimeout(total=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         client = GitHubClient(session, args.token, args.concurrency, args.max_retries)
         for repo in projects:
-            await backfill_project(conn, client, args.org, repo, args.days, metadata_cache)
+            await backfill_project(conn, client, args.org, repo, args.days, args.append, args.refresh_days)
     conn.close()
     print(f"Wrote {args.db} in {time.time() - started:.1f}s")
 

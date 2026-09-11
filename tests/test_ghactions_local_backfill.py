@@ -18,7 +18,6 @@
 """Tests for the local GitHub Actions backfill tool."""
 
 import contextlib
-import asyncio
 import datetime as dt
 import importlib.util
 import io
@@ -116,6 +115,29 @@ class BackfillParsingTest(unittest.TestCase):
 
         self.assertEqual(rows, [(123, 120)])
 
+    def test_runs_needing_backfill_reuses_old_existing_runs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "ghactions.db"
+            conn = backfill.setup_db(str(db_path), append=False)
+            for run_id in (1, 3, 4):
+                conn.execute(
+                    "INSERT INTO runs (id, project, repo, workflow_id, seconds_used, run_start, run_finish) "
+                    "VALUES (?, 'sample', 'sample', 1, 1, 1, 2)",
+                    (run_id,),
+                )
+            refresh_since = dt.datetime(2026, 6, 7, tzinfo=dt.UTC)
+            runs = [
+                {"id": 1, "updated_at": "2026-06-01T00:00:00Z"},
+                {"id": 2, "updated_at": "2026-06-01T00:00:00Z"},
+                {"id": 3, "updated_at": "2026-06-08T00:00:00Z"},
+                {"id": 4},
+            ]
+
+            selected = backfill.runs_needing_backfill(conn, "sample", runs, refresh_since)
+            conn.close()
+
+        self.assertEqual([run["id"] for run in selected], [2, 3, 4])
+
 
 class BackfillPaginationTest(unittest.IsolatedAsyncioTestCase):
     async def test_large_windows_are_split_before_github_result_cap(self):
@@ -128,6 +150,14 @@ class BackfillPaginationTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual({run["id"] for run in runs}, {1, 2})
         self.assertEqual(len(client.window_queries), 3)
+
+    async def test_recent_runs_request_only_completed_workflows(self):
+        client = FakeRecentRunsClient()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            await backfill.list_recent_runs(client, "apache", "iceberg", 7)
+
+        self.assertIn("status=completed", client.window_query)
 
 
 class GitHubClientRateLimitTest(unittest.IsolatedAsyncioTestCase):
@@ -164,6 +194,7 @@ class GitHubClientRateLimitTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("X-RateLimit-Remaining=0", output)
         self.assertIn("X-RateLimit-Reset=110", output)
         self.assertIn("X-RateLimit-Resource=core", output)
+        self.assertIn("paused until approximately", output)
 
     async def test_retries_rate_limit_response_after_retry_after(self):
         clock = FakeClock()
@@ -228,18 +259,37 @@ class GitHubClientRateLimitTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(session.requests), 1)
 
-    async def test_workflow_metadata_coalesces_concurrent_cache_misses(self):
-        client = BlockingMetadataClient()
-        cache = {}
+    async def test_parse_run_uses_workflow_fields_from_the_run_listing(self):
+        client = FakeJsonClient(
+            {
+                "https://example.test/jobs": {
+                    "jobs": [
+                        {
+                            "workflow_name": "CI",
+                            "name": "unit-tests",
+                            "runner_name": "GitHub Actions 1",
+                            "started_at": "2026-06-04T10:00:00Z",
+                            "completed_at": "2026-06-04T10:05:00Z",
+                        }
+                    ]
+                }
+            }
+        )
+        run = {
+            "id": 123,
+            "jobs_url": "https://example.test/jobs",
+            "workflow_url": "https://example.test/workflow",
+            "workflow_id": 456,
+            "name": "CI",
+            "path": ".github/workflows/ci.yml@main",
+        }
 
-        first = asyncio.create_task(backfill.workflow_metadata(client, "https://example.test/workflow", cache))
-        second = asyncio.create_task(backfill.workflow_metadata(client, "https://example.test/workflow", cache))
-        await client.started.wait()
-        self.assertEqual(client.calls, 1)
-        client.release.set()
+        parsed = await backfill.parse_run(client, "sample", run)
 
-        self.assertEqual(await first, {"id": 1})
-        self.assertEqual(await second, {"id": 1})
+        self.assertEqual(client.urls, ["https://example.test/jobs"])
+        self.assertEqual(parsed["workflow_id"], 456)
+        self.assertEqual(parsed["workflow_name"], "CI")
+        self.assertEqual(parsed["workflow_path"], ".github/workflows/ci.yml")
 
 
 class FakeClock:
@@ -289,17 +339,14 @@ class FakeSession:
         return next(self.responses)
 
 
-class BlockingMetadataClient:
-    def __init__(self):
-        self.calls = 0
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
+class FakeJsonClient:
+    def __init__(self, responses):
+        self.responses = responses
+        self.urls = []
 
-    async def get_json(self, _url):
-        self.calls += 1
-        self.started.set()
-        await self.release.wait()
-        return {"id": 1}, None
+    async def get_json(self, url):
+        self.urls.append(url)
+        return self.responses[url], None
 
 
 class FakeRunsClient:
@@ -312,6 +359,15 @@ class FakeRunsClient:
             yield {"total_count": backfill.MAX_GITHUB_LIST_RESULTS + 1, "workflow_runs": [{"id": 999}]}
             return
         yield {"total_count": 1, "workflow_runs": [{"id": len(self.window_queries) - 1}]}
+
+
+class FakeRecentRunsClient:
+    def __init__(self):
+        self.window_query = None
+
+    async def get_all_pages(self, url, _label):
+        self.window_query = url
+        yield {"total_count": 1, "workflow_runs": [{"id": 1}]}
 
 
 if __name__ == "__main__":
